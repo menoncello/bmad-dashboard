@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The mod API is early access and moves between releases, so the
+      # version is pinned. Bump it on purpose and rerun the checks.
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.301
+      - name: Validate the mod
+        run: claude plugin validate .
+      - name: Unit and pane tests
+        run: claude plugin test .

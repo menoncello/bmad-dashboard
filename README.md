@@ -51,3 +51,5 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 claude plugin validate .
 claude plugin test .
 ```
+
+CI (`.github/workflows/ci.yml`) runs both on every push to `main` and on pull requests, with Claude Code pinned to the version the mod was built against. The tests cover the file parsers (YAML, TOML, CSV, frontmatter) and draw every tab of the panel over a virtual BMAD project.

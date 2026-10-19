@@ -1,5 +1,15 @@
 {
   "name": "menoncello-bmad",
-  "owner": { "name": "Eduardo Menoncello" },
-  "plugins": [{ "name": "bmad-dashboard", "source": "./" }]
+  "owner": {
+    "name": "Eduardo Menoncello"
+  },
+  "plugins": [
+    {
+      "name": "bmad-dashboard",
+      "source": "./"
+    }
+  ],
+  "metadata": {
+    "description": "Claude Code mods for BMAD projects"
+  }
 }
