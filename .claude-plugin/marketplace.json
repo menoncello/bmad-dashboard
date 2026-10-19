@@ -1,0 +1,5 @@
+{
+  "name": "menoncello-bmad",
+  "owner": { "name": "Eduardo Menoncello" },
+  "plugins": [{ "name": "bmad-dashboard", "source": "./" }]
+}

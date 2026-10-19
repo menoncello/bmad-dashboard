@@ -1,0 +1,33 @@
+{
+  "name": "bmad-dashboard",
+  "version": "0.1.0",
+  "description": "Panel to follow BMAD projects: sprint, stories, bmad-loop, TEA, planning, pending work and modules",
+  "author": { "name": "Eduardo Menoncello" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "statusLine": {
+      "type": "boolean",
+      "title": "Status line",
+      "description": "Show a BMAD project summary in the status line",
+      "default": true
+    },
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open automatically",
+      "description": "Open the panel when a session starts in a BMAD project (on wide terminals)",
+      "default": true
+    },
+    "refreshSeconds": {
+      "type": "number",
+      "title": "Refresh interval (s)",
+      "description": "How often, in seconds, the panel re-reads the project files",
+      "default": 15
+    },
+    "scanRoots": {
+      "type": "string",
+      "title": "Folders to scan for projects",
+      "description": "Comma-separated folders to search for BMAD projects (Projects tab)",
+      "default": ""
+    }
+  }
+}
