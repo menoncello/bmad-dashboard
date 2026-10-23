@@ -23,6 +23,9 @@ export type BmadStory = {
   format?: 'spec' | 'legacy'
   fileStatus?: string
   type?: string
+  // v7 tickets only
+  risk?: string
+  blockedReason?: string
   route?: string
   tasksDone?: number
   tasksTotal?: number
@@ -161,6 +164,8 @@ export type BmadSnapshot = {
     docLanguage?: string
     skillLevel?: string
     bmadVersion?: string
+    // v6 installs have _bmad/_config/manifest.yaml, v7 ones only bmod.toml files
+    layout?: 'v6' | 'v7'
     installDate?: string
     lastUpdated?: string
     ides: string[]

@@ -62,6 +62,10 @@ function tokens(n: number): string {
   return String(n)
 }
 
+function version(s: BmadSnapshot): string {
+  return `${s.project.bmadVersion ?? '?'}${s.project.layout ? ` (${s.project.layout})` : ''}`
+}
+
 function allStories(s: BmadSnapshot): BmadStory[] {
   return s.sprint?.epics.flatMap(e => e.stories) ?? []
 }
@@ -273,6 +277,8 @@ function StoryLine(c: Ctx, x: BmadStory) {
   const { Box, Text } = c.el
   const tasks = x.tasksTotal ? ` ${x.tasksDone}/${x.tasksTotal}` : ''
   const review = x.reviewOpen ? ` ⚑${x.reviewOpen}` : ''
+  // risk and blockedReason come from v7 tickets only, so v6 rows stay as they were
+  const note = x.risk || x.blockedReason ? [x.type, x.risk && `risk ${x.risk}`, x.blockedReason && `blocked: ${x.blockedReason}`].filter(Boolean).join(' · ') : ''
   return (
     <Box flexDirection="row" columnGap={1}>
       <Box width={6} flexShrink={0}>
@@ -287,6 +293,7 @@ function StoryLine(c: Ctx, x: BmadStory) {
         {x.title ?? x.key}
         <Text dimColor>{tasks}</Text>
         <Text color="warning">{review}</Text>
+        <Text dimColor>{note ? ` · ${note}` : ''}</Text>
       </Text>
     </Box>
   )
@@ -336,7 +343,7 @@ function Overview(c: Ctx) {
       <Text bold>
         {s.project.name}
         <Text dimColor>
-          {'  '}BMAD {s.project.bmadVersion ?? '?'} · {s.modules.map(m => m.name).join(', ')}
+          {'  '}BMAD {version(s)} · {s.modules.map(m => m.name).join(', ')}
         </Text>
       </Text>
       {git && (
@@ -355,7 +362,7 @@ function Overview(c: Ctx) {
             ep?.title && <Text dimColor wrap="truncate-end">{`       ${ep.title}`}</Text>,
             Chips(c, s.sprint.counts),
           ])
-        : Section(c, 'Sprint', [Empty(c, 'No sprint-status.yaml (run bmad-sprint-planning).')])}
+        : Section(c, 'Sprint', [Empty(c, s.project.layout === 'v7' ? 'No tickets for the active initiative.' : 'No sprint-status.yaml (run bmad-sprint-planning).')])}
       {Section(c, 'In progress', wip.length ? wip.map(x => StoryLine(c, x)) : [Empty(c, 'No story in progress.')])}
       {next && Section(c, 'Next', [StoryLine(c, next)])}
       {run &&
@@ -395,7 +402,7 @@ function Overview(c: Ctx) {
 function Sprint($: $, c: Ctx, selected: number) {
   const { Box, Text, Button } = c.el
   const { s } = c
-  if (!s.sprint) return Empty(c, 'No sprint-status.yaml.')
+  if (!s.sprint) return Empty(c, s.project.layout === 'v7' ? 'No tickets for the active initiative.' : 'No sprint-status.yaml.')
   const epics = s.sprint.epics
   const ep = epics.find(e => e.num === selected) ?? currentEpic(s)
   const w = Math.max(6, Math.min(20, c.cols - 50))
@@ -705,7 +712,7 @@ function Modules(c: Ctx) {
         Row(c, 'User', s.project.user),
         Row(c, 'Language', [s.project.language, s.project.docLanguage].filter(Boolean).join(' / docs: ')),
         Row(c, 'Level', s.project.skillLevel),
-        Row(c, 'BMAD', `${s.project.bmadVersion ?? '?'} · installed ${s.project.installDate?.slice(0, 10) ?? '?'} · updated ${s.project.lastUpdated?.slice(0, 10) ?? '?'}`),
+        Row(c, 'BMAD', `${version(s)} · installed ${s.project.installDate?.slice(0, 10) ?? '?'} · updated ${s.project.lastUpdated?.slice(0, 10) ?? '?'}`),
         Row(c, 'IDEs', s.project.ides.join(', ')),
       ])}
       {Section(

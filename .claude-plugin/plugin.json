@@ -1,6 +1,6 @@
 {
   "name": "bmad-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Panel to follow BMAD projects: sprint, stories, bmad-loop, TEA, planning, pending work and modules",
   "author": { "name": "Eduardo Menoncello" },
   "types": "./types/index.d.ts",

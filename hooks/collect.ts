@@ -552,6 +552,114 @@ async function docArtifacts($: $, dir: string, depth: number, kindOf: (rel: stri
   return out.sort((a, b) => b.mtimeMs - a.mtimeMs)
 }
 
+// ---------- v7 install ----------
+
+const skillOf = (r: Record<string, string>): BmadSkill => ({
+  name: r['display-name'] || r.skill,
+  module: r.module,
+  description: r.description,
+  phase: r.phase,
+  menuCode: r['menu-code'],
+  required: /^true|yes$/i.test(r.required ?? ''),
+})
+
+// v7 has no manifest: modules are the [bmod] records of the skills' bmod.toml
+// files, the skills come from each module's module-help.csv.
+async function collectV7($: $, root: string): Promise<{ version?: string; modules: BmadModule[]; skills: BmadSkill[] }> {
+  const modules: BmadModule[] = []
+  for (const e of await list($, `${root}/.agents/skills`)) {
+    if (e.kind === 'file') continue // a symlinked skill folder lists as 'other'
+    const b = obj((await cached($, `${root}/.agents/skills/${e.name}/bmod.toml`, undefined, parseToml))?.bmod)
+    const name = str(b.code)
+    if (name) modules.push({ name, version: str(b.version), source: str(b.update_source) })
+  }
+  modules.sort((a, b) => a.name.localeCompare(b.name))
+  const skills: BmadSkill[] = []
+  for (const e of await list($, `${root}/_bmad`)) {
+    if (e.kind !== 'dir' || e.name.startsWith('_')) continue
+    const rows = (await cached($, `${root}/_bmad/${e.name}/module-help.csv`, undefined, parseCsv)) ?? []
+    for (const r of rows) if (r.skill && r.skill !== '_meta') skills.push(skillOf(r))
+  }
+  return { version: (modules.find(m => m.name === 'method') ?? modules.find(m => m.version))?.version, modules, skills }
+}
+
+// ---------- v7 tickets ----------
+
+const TICKETS = '_bmad/method/scripts/tickets.py'
+
+// The ticket rules stay in the project's own script; this only maps its JSON
+// onto the sprint shape. Epic titles are not in that JSON, tickets.toml has them.
+async function collectTickets($: $, root: string, output: string, initiative: string | undefined, errors: string[]): Promise<BmadSnapshot['sprint']> {
+  if (!initiative) return undefined
+  const file = `${output}/${initiative}/tickets/tickets.toml`
+  const plan = await cached($, file, undefined, parseToml)
+  if (!plan) return undefined
+  const script = `${root}/${TICKETS}`
+  if (!(await $.fs.exists(script))) {
+    errors.push(`${TICKETS} not found`)
+    return undefined
+  }
+  // the script needs python >= 3.11; uv reads its header and finds one
+  let stdout: string | undefined
+  let failure: string | undefined
+  for (const cmd of [['python3'], ['uv', 'run']]) {
+    try {
+      const r = await $.process.run([...cmd, script, '--project-root', root, 'status'], { cwd: root, timeoutMs: 15000 })
+      if (r.exitCode === 0) {
+        stdout = r.stdout
+        break
+      }
+      failure ??= r.stderr.trim().split('\n').pop()
+    } catch (e) {
+      failure ??= String((e as Error)?.message ?? e)
+    }
+  }
+  if (stdout === undefined) {
+    errors.push(`tickets.py failed: ${failure || 'no output'}`.slice(0, 160))
+    return undefined
+  }
+  let status: Obj
+  try {
+    status = obj(JSON.parse(stdout) as Json)
+  } catch {
+    errors.push('tickets.py did not print JSON')
+    return undefined
+  }
+
+  const titles = new Map(arr(plan.epic).map(e => [str(obj(e).slug), str(obj(e).title)]))
+  const epics = new Map<string, BmadEpic>()
+  for (const e of arr(status.epics).map(obj)) {
+    const slug = str(e.slug) ?? ''
+    epics.set(slug, { num: Number(e.id), title: titles.get(slug) ?? slug, status: str(e.status) || 'backlog', stories: [] })
+  }
+  const counts: Record<string, number> = {}
+  for (const t of arr(status.tickets).map(obj)) {
+    const ep = epics.get(str(t.epic) ?? '')
+    if (!ep) continue
+    const state = str(t.state) ?? 'backlog'
+    const st = state === 'planned' ? 'backlog' : state
+    counts[st] = (counts[st] ?? 0) + 1
+    ep.stories.push({
+      key: str(t.ref) ?? `${ep.num}.${t.id}`,
+      epic: ep.num,
+      num: str(t.id) ?? '',
+      title: str(t.title),
+      status: st,
+      type: t.type === 'story' ? undefined : str(t.type),
+      risk: str(t.risk) || undefined,
+      blockedReason: str(t.blocked_reason) || undefined,
+    })
+  }
+  return {
+    file: file.slice(root.length + 1),
+    generated: new Date().toISOString().slice(0, 16).replace('T', ' '),
+    stale: false,
+    counts,
+    epics: [...epics.values()].sort((a, b) => a.num - b.num),
+    actionItems: [],
+  }
+}
+
 // ---------- the snapshot ----------
 
 export async function collect($: $, root: string): Promise<BmadSnapshot> {
@@ -593,10 +701,12 @@ export async function collect($: $, root: string): Promise<BmadSnapshot> {
   const knowledge = resolvePath(val('project_knowledge', 'bmm'), root, vars)
   if (knowledge) paths.knowledge = knowledge
 
-  // manifest
+  // manifest (v6) or bmod.toml files (v7); the version number can't tell them apart
   const manifest = obj(await cached($, `${bmad}/_config/manifest.yaml`, undefined, parseYaml))
+  const layout = !(await $.fs.exists(`${bmad}/_config/manifest.yaml`)) && (await $.fs.exists(`${bmad}/config.toml`)) ? 'v7' : 'v6'
+  const v7 = layout === 'v7' ? await collectV7($, root) : undefined
   const inst = obj(manifest.installation)
-  const modules: BmadModule[] = arr(manifest.modules).map(m => {
+  const modules: BmadModule[] = v7?.modules ?? arr(manifest.modules).map(m => {
     const o = obj(m)
     return {
       name: str(o.name) ?? '?',
@@ -616,14 +726,7 @@ export async function collect($: $, root: string): Promise<BmadSnapshot> {
   })
 
   const help = (await cached($, `${bmad}/_config/bmad-help.csv`, undefined, parseCsv)) ?? []
-  const skills: BmadSkill[] = help.map(r => ({
-    name: r['display-name'] || r.skill,
-    module: r.module,
-    description: r.description,
-    phase: r.phase,
-    menuCode: r['menu-code'],
-    required: /^true|yes$/i.test(r.required ?? ''),
-  }))
+  const skills: BmadSkill[] = v7?.skills ?? help.map(skillOf)
 
   // epic and story titles
   const titles = { epics: new Map<number, string>(), stories: new Map<string, string>() }
@@ -768,6 +871,7 @@ export async function collect($: $, root: string): Promise<BmadSnapshot> {
     }
     break
   }
+  if (!sprint && v7) sprint = await collectTickets($, root, output, str(core.active_initiative), errors)
 
   const storiesOutsideSprint: BmadStory[] = []
   for (const [slug, f] of storyFiles) {
@@ -855,7 +959,8 @@ export async function collect($: $, root: string): Promise<BmadSnapshot> {
       language: str(core.communication_language) ?? str(flat.communication_language),
       docLanguage: str(core.document_output_language) ?? str(flat.document_output_language),
       skillLevel: val('user_skill_level', 'bmm'),
-      bmadVersion: str(inst.version),
+      bmadVersion: v7 ? v7.version : str(inst.version),
+      layout,
       installDate: str(inst.installDate),
       lastUpdated: str(inst.lastUpdated),
       ides: arr(manifest.ides).map(x => str(x) ?? '').filter(Boolean),

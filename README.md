@@ -2,6 +2,8 @@
 
 A Claude Code mod that opens a panel with the state of the BMAD project in the current directory. It reads the project files (`_bmad/`, `_bmad-output/`, `.bmad-loop/`) and refreshes every 15 seconds.
 
+BMAD v6 and v7 projects are both detected (v6 has `_bmad/_config/manifest.yaml`, v7 has `_bmad/config.toml` and no manifest) and the version shows its layout, as in `6.13.0-next (v7)`. On v7 the modules and version come from the `bmod.toml` files in `.agents/skills/`, the skills from each `_bmad/<module>/module-help.csv`. The Sprint tab reads the ticket tree of the active initiative (`core.active_initiative`) by running the project's own `_bmad/method/scripts/tickets.py status` (python3 3.11 or newer, or `uv`): epics, tickets and their progress, with type, risk and blocked reason next to each ticket. Epic titles come from the initiative's `tickets/tickets.toml`. With no active initiative or no tickets there, the tab stays empty.
+
 ## Tabs
 
 1. **Overview**: BMAD version, modules, git, sprint and current epic progress, stories in progress, next story, bmad-loop state and alerts.

@@ -107,6 +107,7 @@ const ROOT = '/work/demo'
 const FILES: Record<string, string> = {
   [`${ROOT}/_bmad/config.toml`]: `[core]\nproject_name = "demo"\nuser_name = "Eu"\noutput_folder = "{project-root}/_bmad-output"\n\n[modules.bmm]\nplanning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\nimplementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n\n[agents.bmad-agent-dev]\nname = "Amelia"\ntitle = "Dev"\nicon = "💻"\nmodule = "bmm"\n`,
   [`${ROOT}/_bmad/_config/manifest.yaml`]: `installation:\n  version: 6.12.4\nmodules:\n  - name: core\n    version: 6.12.4\n    source: built-in\n  - name: bmad-loop\n    version: v0.13.2\n    source: external\nides:\n  - claude-code\n`,
+  [`${ROOT}/_bmad/_config/bmad-help.csv`]: `module,skill,display-name,menu-code,description,phase,required\nbmm,bmad-prd,Create PRD,CP,Write the PRD.,2-planning,true\n`,
   [`${ROOT}/_bmad-output/planning-artifacts/epics.md`]: `---\nstatus: final\n---\n# Epics\n## Epic 1: Foundation\n### Story 1.1: Skeleton\n### Story 1.2: Second\n`,
   [`${ROOT}/_bmad-output/planning-artifacts/prds/prd-demo/prd.md`]: `---\ntitle: Demo PRD\nstatus: final\n---\n# PRD\n`,
   [`${ROOT}/_bmad-output/implementation-artifacts/sprint-status.yaml`]: SPRINT.replace('1-1-walking-skeleton', '1-1-skeleton').replace('1-2a-second-story', '1-2-second'),
@@ -118,9 +119,9 @@ const FILES: Record<string, string> = {
   [`${ROOT}/.bmad-loop/runs/20261018-224447-4380/journal.jsonl`]: '',
 }
 
-function children(dir: string) {
+function children(dir: string, files = FILES) {
   const out = new Map<string, 'file' | 'dir'>()
-  for (const f of Object.keys(FILES)) {
+  for (const f of Object.keys(files)) {
     if (!f.startsWith(dir + '/')) continue
     const rest = f.slice(dir.length + 1).split('/')
     out.set(rest[0]!, rest.length > 1 ? 'dir' : 'file')
@@ -129,28 +130,31 @@ function children(dir: string) {
 }
 
 // operation hooks answer `{ value }`
-function fakeProject(on: any) {
+function fakeProject(on: any, files = FILES, cwd = ROOT) {
   mock.store(on)
   on('ui.status', () => ({ value: undefined }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  const isDir = (p: string) => children(p).size > 0
-  on('session.cwd', () => ({ value: ROOT }))
-  on('fs.exists', (_$: unknown, e: { path: string }) => ({ value: e.path in FILES || isDir(e.path) }))
+  const isDir = (p: string) => children(p, files).size > 0
+  on('session.cwd', () => ({ value: cwd }))
+  on('fs.exists', (_$: unknown, e: { path: string }) => ({ value: e.path in files || isDir(e.path) }))
   on('fs.read', (_$: unknown, e: { path: string }) => {
-    if (!(e.path in FILES)) throw new Error('ENOENT')
-    return { value: FILES[e.path] }
+    if (!(e.path in files)) throw new Error('ENOENT')
+    return { value: files[e.path] }
   })
   on('fs.stat', (_$: unknown, e: { path: string }) => {
-    if (e.path in FILES) return { value: { kind: 'file', size: FILES[e.path]!.length, mtimeMs: 1, isLink: false } }
+    if (e.path in files) return { value: { kind: 'file', size: files[e.path]!.length, mtimeMs: 1, isLink: false } }
     if (isDir(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
     throw new Error('ENOENT')
   })
   on('fs.list', (_$: unknown, e: { path: string }) => ({
-    value: [...children(e.path)].map(([name, kind]) => ({ name, kind, size: kind === 'file' ? FILES[`${e.path}/${name}`]!.length : 0, mtimeMs: 1, isLink: false })),
+    value: [...children(e.path, files)].map(([name, kind]) => ({ name, kind, size: kind === 'file' ? files[`${e.path}/${name}`]!.length : 0, mtimeMs: 1, isLink: false })),
   }))
-  on('process.run', (_$: unknown, e: { argv: readonly string[] }) => ({
-    value: e.argv[0] === 'ps' ? { exitCode: 0, stdout: 'python -m bmad_loop.cli run\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: '' },
-  }))
+  // the virtual tickets.py holds the JSON it would print, so reading it stands in for running it
+  on('process.run', (_$: unknown, e: { argv: readonly string[] }) => {
+    const script = `${cwd}/_bmad/method/scripts/tickets.py`
+    if (e.argv.join(' ') === `python3 ${script} --project-root ${cwd} status` && script in files) return { value: { exitCode: 0, stdout: files[script], stderr: '' } }
+    return { value: e.argv[0] === 'ps' ? { exitCode: 0, stdout: 'python -m bmad_loop.cli run\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: '' } }
+  })
 }
 
 describe('pane over a project', () => {
@@ -180,4 +184,101 @@ describe('pane over a project', () => {
       await ui.unmount()
     })
   }
+})
+
+// BMAD v7 has no _bmad/_config: bmod.toml files hold the modules, each module its help CSV.
+const V7 = '/work/v7demo'
+const V7_FILES: Record<string, string> = {
+  [`${V7}/_bmad/config.toml`]: `[core]\nproject_name = "v7demo"\n\n[modules.tea]\ntest_artifacts = "{project-root}/_bmad-output/qa"\n\n[agents.bmad-agent-dev]\nname = "Amelia"\ntitle = "Dev"\nicon = "💻"\nmodule = "bmm"\n`,
+  [`${V7}/.agents/skills/bmod-core-tools/bmod.toml`]: `[bmod]\ncode = "core-tools"\nversion = "6.12.4"\nupdate_source = "github:acme/core"\nskills = ["bmad"]\n`,
+  [`${V7}/.agents/skills/bmod-method/bmod.toml`]: `[bmod]\ncode = "method"\nversion = "6.13.0-next"\nupdate_source = "github:acme/method"\nskills = [\n  "bmad-prd",\n]\n`,
+  [`${V7}/.agents/skills/bmad-prd/bmod.toml`]: `[skill]\nbmod = "bmod-method"\n`,
+  [`${V7}/_bmad/tea/module-help.csv`]: `module,skill,display-name,menu-code,description,action,args,phase,preceded-by,followed-by,required,output-location,outputs\nTEA,_meta,,,,,,,,,false,https://example.com/llms.txt,\nTEA,bmad-testarch-test-design,Test Design,TD,Risk-based test planning.,,,3-solutioning,,,false,test_artifacts,doc\n`,
+}
+
+// the v7 ticket tree: tickets.py status (stubbed) gives the tickets, tickets.toml the epic titles
+const TICKETS_JSON = JSON.stringify({
+  epics: [
+    { slug: 'epic-b', id: 2, status: '' },
+    { slug: 'epic-a', id: 1, status: '' },
+  ],
+  tickets: [
+    { epic: 'epic-a', id: 1, type: 'story', title: 'First', state: 'done', risk: 'medium', blocked_reason: '', ref: '1.1' },
+    { epic: 'epic-a', id: 2, type: 'spike', title: 'Why', state: 'review', risk: 'high', blocked_reason: '', ref: '1.2' },
+    { epic: 'epic-a', id: 3, type: 'bug', title: 'Third', state: 'planned', risk: 'low', blocked_reason: 'waits for CVM', ref: '1.3' },
+    { epic: 'epic-b', id: 1, type: 'story', title: 'Other', state: 'in-progress', risk: '', blocked_reason: '', ref: '2.1' },
+  ],
+})
+const V7_TICKET_FILES: Record<string, string> = {
+  ...V7_FILES,
+  [`${V7}/_bmad/custom/config.user.toml`]: `[core]\nactive_initiative = "initiative-demo"\n`,
+  [`${V7}/_bmad-output/initiative-demo/tickets/tickets.toml`]: `[[epic]]\nid = 1\nslug = "epic-a"\ntitle = "Epic A title"\n\n[[epic]]\nid = 2\nslug = "epic-b"\nafter = [{ epic = 1, needs = "a thing" }]\n`,
+  [`${V7}/_bmad/method/scripts/tickets.py`]: TICKETS_JSON,
+}
+
+// the status tool hands back the snapshot as JSON, whole or by section
+async function status($: any, section: string) {
+  const r = await $.tool.call({ tool: 'mcp__bmad-dashboard__status', section })
+  return JSON.parse(r.result as string)
+}
+
+describe('layout', () => {
+  test('v6 reads the manifest and bmad-help.csv', async ($, on) => {
+    fakeProject(on)
+    const s = await status($, 'all')
+    expect(s.project.layout).toBe('v6')
+    expect(s.project.bmadVersion).toBe('6.12.4')
+    expect(s.project.ides).toEqual(['claude-code'])
+    expect(s.modules.map((m: any) => `${m.name}@${m.version}`)).toEqual(['core@6.12.4', 'bmad-loop@v0.13.2'])
+    expect(s.skills).toEqual([{ name: 'Create PRD', module: 'bmm', description: 'Write the PRD.', phase: '2-planning', menuCode: 'CP', required: true }])
+    expect(s.agents.map((a: any) => a.name)).toEqual(['Amelia'])
+  })
+
+  test('v7 reads bmod.toml, module-help.csv and config.toml agents', async ($, on) => {
+    fakeProject(on, V7_FILES, V7)
+    const s = await status($, 'all')
+    expect(s.project.layout).toBe('v7')
+    expect(s.project.bmadVersion).toBe('6.13.0-next') // the method module's, not the first one listed
+    expect(s.project.ides).toEqual([])
+    expect(s.modules).toEqual([
+      { name: 'core-tools', version: '6.12.4', source: 'github:acme/core' },
+      { name: 'method', version: '6.13.0-next', source: 'github:acme/method' },
+    ])
+    expect(s.skills).toEqual([{ name: 'Test Design', module: 'TEA', description: 'Risk-based test planning.', phase: '3-solutioning', menuCode: 'TD', required: false }])
+    expect(s.agents).toEqual([{ code: 'bmad-agent-dev', name: 'Amelia', title: 'Dev', icon: '💻', module: 'bmm' }])
+    expect(s.paths.tests).toBe(`${V7}/_bmad-output/qa`)
+    expect(s.sprint).toBeUndefined()
+  })
+
+  test('v7 fills the sprint from the ticket tree script', async ($, on) => {
+    fakeProject(on, V7_TICKET_FILES, V7)
+    const s = await status($, 'all')
+    expect(s.errors).toEqual([])
+    expect(s.sprint.file).toBe('_bmad-output/initiative-demo/tickets/tickets.toml')
+    expect(s.sprint.counts).toEqual({ done: 1, review: 1, backlog: 1, 'in-progress': 1 })
+    expect(s.sprint.epics.map((e: any) => [e.num, e.title, e.stories.length])).toEqual([
+      [1, 'Epic A title', 3],
+      [2, 'epic-b', 1], // no title in tickets.toml: the slug
+    ])
+    const [first, spike, bug] = s.sprint.epics[0].stories
+    expect(first).toMatchObject({ key: '1.1', epic: 1, num: '1', title: 'First', status: 'done', risk: 'medium' })
+    expect(first.type).toBeUndefined()
+    expect(spike).toMatchObject({ num: '2', status: 'review', type: 'spike', risk: 'high' })
+    expect(bug).toMatchObject({ status: 'backlog', type: 'bug', blockedReason: 'waits for CVM' })
+    expect(s.sprint.epics[1].stories[0]).toMatchObject({ epic: 2, status: 'in-progress' })
+    expect(s.sprint.epics[1].stories[0].risk).toBeUndefined() // an empty risk is left out
+  })
+
+  test('v7 without tickets leaves the sprint empty, and says so when the script is gone', async ($, on) => {
+    const { [`${V7}/_bmad/method/scripts/tickets.py`]: _stub, ...noScript } = V7_TICKET_FILES
+    fakeProject(on, noScript, V7)
+    const s = await status($, 'all')
+    expect(s.sprint).toBeUndefined()
+    expect(s.errors).toEqual(['_bmad/method/scripts/tickets.py not found'])
+  })
+
+  test('a v7-only project (no _bmad/_config) is found from a subfolder', async ($, on) => {
+    fakeProject(on, V7_FILES, `${V7}/src/deep`)
+    expect((await status($, 'all')).root).toBe(V7)
+  })
 })
