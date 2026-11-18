@@ -18,27 +18,41 @@ import type {
 } from '../types'
 import { arr, deepMerge, frontmatter, obj, parseCsv, parseToml, parseYaml, str } from './parse'
 import type { Doc, Json, Obj } from './parse'
-import { collectAutomator, collectBuilder, collectWds, qualitySummary, reviewScore, workflowStatus } from './modules'
+import { collectAutomator, collectBuilder, collectWds, isFinishedStatus, list, memoizeLists, qualitySummary, reviewScore, statusIs, workflowStatus } from './modules'
 
 type $ = EngineInterface
 
-// Parsed files keyed by path, reused while mtime and size hold. A module
-// variable on purpose: a reload starts it over, which is only a cold cache.
-const cache = new Map<string, { mtimeMs: number; size: number; value: unknown }>()
+// Parsed files keyed by path, reused while mtime and size hold. Module-level
+// on purpose: a reload starts them over, which is only a cold cache. Each entry
+// remembers the collect that last used it, and collect() drops the ones nobody
+// has touched for a few rounds (another project's files, deleted files).
+let generation = 0
+const KEEP_GENERATIONS = 6
+
+type Stamped = { used: number }
+const cache = new Map<string, Stamped & { mtimeMs: number; size: number; value: unknown }>()
+const runCache = new Map<string, Stamped & { key: string; run: BmadLoopRun }>() // finished bmad-loop runs
+const ticketsCache = new Map<string, Stamped & { key: string; at: number; status: Obj }>() // tickets.py output per root
+const launchers = new Map<string, string[]>() // the launcher that worked for tickets.py, per root
+
+function prune() {
+  for (const map of [cache, runCache, ticketsCache] as Map<string, Stamped>[]) for (const [k, v] of map) if (generation - v.used > KEEP_GENERATIONS) map.delete(k)
+}
+
+// For tests: forget everything the collectors remember between runs.
+export function resetCaches(): void {
+  generation = 0
+  cache.clear()
+  runCache.clear()
+  ticketsCache.clear()
+  launchers.clear()
+}
 
 async function readText($: $, path: string): Promise<string | undefined> {
   try {
     return await $.fs.read(path)
   } catch {
     return undefined
-  }
-}
-
-async function list($: $, dir: string): Promise<FsEntry[]> {
-  try {
-    return await $.fs.list(dir)
-  } catch {
-    return []
   }
 }
 
@@ -60,7 +74,10 @@ async function cached<T>(
   }
   const id = `${tag}|${path}`
   const hit = cache.get(id)
-  if (hit && hit.mtimeMs === meta.mtimeMs && hit.size === meta.size) return hit.value as T
+  if (hit && hit.mtimeMs === meta.mtimeMs && hit.size === meta.size) {
+    hit.used = generation
+    return hit.value as T
+  }
   if (meta.size > 4 * 1024 * 1024) return undefined
   const text = await readText($, path)
   if (text === undefined) return undefined
@@ -70,7 +87,7 @@ async function cached<T>(
   } catch {
     return undefined
   }
-  cache.set(id, { mtimeMs: meta.mtimeMs, size: meta.size, value })
+  cache.set(id, { mtimeMs: meta.mtimeMs, size: meta.size, value, used: generation })
   return value
 }
 
@@ -160,29 +177,23 @@ function resolvePath(raw: string | undefined, root: string, vars: Record<string,
 const STORY_FILE = /^(\d+)-(\d+[a-z]?)-.+\.md$/
 const SPEC_FILE = /^spec-(.+)\.md$/
 
-function countTasks(body: string, format: 'spec' | 'legacy') {
-  const section = format === 'spec' ? /^## Tasks/m : /^## Tasks/m
-  const start = body.search(section)
+// Tasks are the checkboxes under a "## Tasks..." heading, up to the next "## "
+// heading. [Review] checkboxes are counted apart, wherever they are.
+export function countTasks(body: string) {
   let done = 0
   let total = 0
   let reviewOpen = 0
   let reviewDone = 0
-  const lines = body.split('\n')
   let inTasks = false
-  let offset = 0
-  for (const line of lines) {
-    if (offset >= start && start >= 0 && /^## Tasks/.test(line)) inTasks = true
-    else if (inTasks && /^## /.test(line)) inTasks = false
-    offset += line.length + 1
+  for (const line of body.split('\n')) {
+    if (/^## /.test(line)) inTasks = /^## Tasks/.test(line)
     const box = /^\s*[-*] \[( |x|X)\]/.exec(line)
     if (!box) continue
     const checked = box[1] !== ' '
     if (/\[Review\]/.test(line)) {
       if (checked) reviewDone++
       else reviewOpen++
-      continue
-    }
-    if (inTasks) {
+    } else if (inTasks) {
       total++
       if (checked) done++
     }
@@ -206,11 +217,11 @@ function parseStory(text: string, format: 'spec' | 'legacy'): StoryFile {
     title,
     type: str(fm.type),
     route: str(fm.route),
-    ...countTasks(doc.body, format),
+    ...countTasks(doc.body),
   }
 }
 
-function storyNumbers(key: string): { epic: number; num: string } | undefined {
+export function storyNumbers(key: string): { epic: number; num: string } | undefined {
   const m = /^(?:spec-)?(?:dw-)?(\d+)-(\d+[a-z]?)(?:-|$)/.exec(key)
   return m ? { epic: Number(m[1]), num: m[2] } : undefined
 }
@@ -219,7 +230,10 @@ function storyNumbers(key: string): { epic: number; num: string } | undefined {
 
 const SPRINT_ALIASES: Record<string, string> = { drafted: 'ready-for-dev', contexted: 'in-progress' }
 
-function parseEpicTitles(text: string): { epics: Map<number, string>; stories: Map<string, string> } {
+// work that was given up: the v7 `dropped` state, or a cancelled story
+export const isDroppedStatus = (status: string | undefined): boolean => statusIs(status, ['dropped', 'cancelled', 'canceled'])
+
+export function parseEpicTitles(text: string): { epics: Map<number, string>; stories: Map<string, string> } {
   const epics = new Map<number, string>()
   const stories = new Map<string, string>()
   let fenced = false
@@ -237,7 +251,7 @@ function parseEpicTitles(text: string): { epics: Map<number, string>; stories: M
   return { epics, stories }
 }
 
-function parseSprintDate(s: string | undefined): number | undefined {
+export function parseSprintDate(s: string | undefined): number | undefined {
   if (!s) return undefined
   let m = /^(\d{2})-(\d{2})-(\d{4})(?:\s+(\d{2}):(\d{2}))?/.exec(s)
   if (m) return new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]), Number(m[4] ?? 0), Number(m[5] ?? 0)).getTime()
@@ -248,7 +262,13 @@ function parseSprintDate(s: string | undefined): number | undefined {
 
 // ---------- deferred work ----------
 
-function parseDeferred(text: string): BmadDeferred[] {
+// "in-progress (waiting)" -> "in-progress"; "not done" keeps both words
+function openStatus(status: string): string {
+  const words = status.split(/\s+/)
+  return words.slice(0, /^(not|never)$/i.test(words[0] ?? '') ? 2 : 1).join('-').toLowerCase()
+}
+
+export function parseDeferred(text: string): BmadDeferred[] {
   const out: BmadDeferred[] = []
   const blocks = text.split(/^###\s+/m).slice(1)
   for (const b of blocks) {
@@ -260,7 +280,7 @@ function parseDeferred(text: string): BmadDeferred[] {
       id: head[1],
       title: head[2].trim(),
       severity: field('severity'),
-      status: /^done|resolved|closed/i.test(status) ? 'done' : status.split(/\s/)[0].toLowerCase(),
+      status: statusIs(status, ['done', 'resolved', 'closed']) ? 'done' : openStatus(status),
       origin: field('origin'),
     })
   }
@@ -271,7 +291,7 @@ function parseDeferred(text: string): BmadDeferred[] {
       const m = /^\s*[-*]\s+(.+)$/.exec(line)
       if (!m || /^\s*[-*]\s+(source_spec|summary|evidence)\s*:/.test(line)) continue
       n++
-      out.push({ id: `#${n}`, title: m[1].replace(/\*\*/g, '').slice(0, 140), status: /RESOLVED/i.test(m[1]) ? 'done' : 'open' })
+      out.push({ id: `#${n}`, title: m[1].replace(/\*\*/g, '').slice(0, 140), status: statusIs(m[1], ['resolved']) ? 'done' : 'open' })
     }
   }
   return out
@@ -293,7 +313,8 @@ function tokensOf(t: Obj, weight: number): { raw: number; weighted: number } {
 async function pidAlive($: $, pid: number): Promise<boolean> {
   try {
     const r = await $.process.run(['ps', '-p', String(pid), '-o', 'command='], { timeoutMs: 5000 })
-    return r.exitCode === 0 && r.stdout.trim().length > 0
+    // a recycled pid belongs to some other program; it has to still be the engine
+    return r.exitCode === 0 && /bmad[-_ ]?loop/i.test(r.stdout)
   } catch {
     return false
   }
@@ -309,8 +330,36 @@ function eventDetail(ev: Obj): string | undefined {
   return parts.join(' ').slice(0, 200) || undefined
 }
 
+// A run whose state says finished, stopped or crashed cannot change any more.
+const settled = (st: Obj): boolean => st.finished === true || (!st.paused_reason && (st.stopped === true || st.crashed === true))
+
+async function statKey($: $, path: string): Promise<string> {
+  try {
+    const s = await $.fs.stat(path)
+    return `${s.mtimeMs}:${s.size}`
+  } catch {
+    return '-'
+  }
+}
+
 async function collectRun($: $, dir: string, runId: string, weight: number): Promise<BmadLoopRun> {
   const st = obj((await cached($, `${dir}/state.json`, undefined, t => JSON.parse(t) as Json, 'json')) ?? {})
+  // a settled run is rebuilt only when state.json or the journal changed: no ps, no tail
+  let key: string | undefined
+  if (settled(st)) {
+    key = `${weight}|${await statKey($, `${dir}/state.json`)}|${await statKey($, `${dir}/journal.jsonl`)}`
+    const hit = runCache.get(dir)
+    if (hit && hit.key === key) {
+      hit.used = generation
+      return hit.run
+    }
+  }
+  const run = await readRun($, dir, runId, weight, st)
+  if (key) runCache.set(dir, { key, run, used: generation })
+  return run
+}
+
+async function readRun($: $, dir: string, runId: string, weight: number, st: Obj): Promise<BmadLoopRun> {
   const pidText = (await readText($, `${dir}/engine.pid`))?.trim()
   const pid = pidText ? Number(pidText.split(/\s+/)[0]) : undefined
   const attention = ((await readText($, `${dir}/ATTENTION`)) ?? '').split('\n').filter(Boolean).slice(-8)
@@ -476,8 +525,7 @@ async function collectLoop($: $, root: string, hasModule: boolean): Promise<Bmad
     .sort()
     .reverse()
     .slice(0, 6)
-  const runs: BmadLoopRun[] = []
-  for (const id of runIds) runs.push(await collectRun($, `${base}/runs/${id}`, id, weight))
+  const runs = await Promise.all(runIds.map(id => collectRun($, `${base}/runs/${id}`, id, weight)))
   return { installed: true, policy, runs }
 }
 
@@ -506,37 +554,66 @@ async function collectGit($: $, root: string): Promise<BmadGit | undefined> {
 
 // ---------- artifacts ----------
 
-function planningKind(rel: string): string {
-  const r = rel.toLowerCase()
-  if (r.includes('sprint-change-proposal')) return 'change-proposal'
-  if (r.includes('readiness')) return 'readiness'
-  if (r.includes('prfaq')) return 'prfaq'
-  if (r.includes('brief')) return 'brief'
-  if (r.includes('prd')) return 'prd'
-  if (r.includes('ux')) return 'ux'
-  if (r.includes('architecture')) return 'architecture'
-  if (r.includes('research')) return 'research'
-  if (r.includes('epic')) return 'epics'
-  if (r.includes('project-context')) return 'project-context'
-  if (r.includes('gdd') || r.includes('game-design')) return 'gdd'
-  if (r.includes('game-brief')) return 'game-brief'
-  if (r.includes('narrative')) return 'narrative'
-  return 'doc'
+// Kinds come from whole words of the file name; the folders only decide when
+// the file name says nothing. Rules are tried in order, so the specific ones go
+// first. A word also matches its plural ("epics", "prds").
+type Rule = [kind: string, ...phrases: string[]]
+
+const PLANNING_RULES: Rule[] = [
+  ['change-proposal', 'sprint change proposal'],
+  ['readiness', 'readiness'],
+  ['prfaq', 'prfaq'],
+  ['game-brief', 'game brief'],
+  ['gdd', 'gdd', 'game design'],
+  ['brief', 'brief'],
+  ['prd', 'prd'],
+  ['ux', 'ux'],
+  ['architecture', 'architecture'],
+  ['research', 'research'],
+  ['epics', 'epic'],
+  ['project-context', 'project context'],
+  ['narrative', 'narrative'],
+]
+
+const QUALITY_RULES: Rule[] = [
+  ['atdd', 'atdd'],
+  ['automation', 'automation'],
+  ['trace', 'trace', 'traceability'],
+  ['nfr', 'nfr'],
+  ['gate', 'gate'],
+  ['test-design', 'test design'],
+  ['test-review', 'review'],
+  ['framework', 'framework'],
+  ['ci', 'ci'],
+]
+
+const wordsOf = (s: string) => s.toLowerCase().split(/[\/\-_.\s]+/).filter(Boolean)
+
+function ruleKind(name: string, rules: Rule[]): string | undefined {
+  const tokens = wordsOf(name)
+  for (const [kind, ...phrases] of rules) {
+    for (const phrase of phrases) {
+      const words = phrase.split(' ')
+      for (let i = 0; i + words.length <= tokens.length; i++) {
+        if (words.every((w, j) => tokens[i + j] === w || tokens[i + j] === `${w}s`)) return kind
+      }
+    }
+  }
+  return undefined
 }
 
-function qualityKind(rel: string): string {
-  const r = rel.toLowerCase()
-  if (r.includes('atdd')) return 'atdd'
-  if (r.includes('automation')) return 'automation'
-  if (r.includes('trace')) return 'trace'
-  if (r.includes('nfr')) return 'nfr'
-  if (r.includes('gate')) return 'gate'
-  if (r.includes('test-design')) return 'test-design'
-  if (r.includes('review')) return 'test-review'
-  if (r.includes('framework')) return 'framework'
-  if (r.includes('ci')) return 'ci'
-  return 'test-doc'
+function kindOf(rel: string, rules: Rule[], fallback: string): string {
+  const parts = rel.split('/')
+  const base = parts.pop()!.replace(/\.[^.]*$/, '')
+  for (const name of [base, ...parts.reverse()]) {
+    const kind = ruleKind(name, rules)
+    if (kind) return kind
+  }
+  return fallback
 }
+
+export const planningKind = (rel: string): string => kindOf(rel, PLANNING_RULES, 'doc')
+export const qualityKind = (rel: string): string => kindOf(rel, QUALITY_RULES, 'test-doc')
 
 const SKIP_DIRS = new Set(['.working', 'mockups', 'node_modules', '.git', 'assets', 'images'])
 
@@ -554,76 +631,130 @@ async function docArtifacts($: $, dir: string, depth: number, kindOf: (rel: stri
 
 // ---------- v7 install ----------
 
-const skillOf = (r: Record<string, string>): BmadSkill => ({
+export const skillOf = (r: Record<string, string>): BmadSkill => ({
   name: r['display-name'] || r.skill,
   module: r.module,
   description: r.description,
   phase: r.phase,
   menuCode: r['menu-code'],
-  required: /^true|yes$/i.test(r.required ?? ''),
+  required: /^(true|yes)$/i.test((r.required ?? '').trim()),
 })
 
+const headerVersion = (t: string) => /^#\s*Version:\s*(\S+)/m.exec(t)?.[1]
+
 // v7 has no manifest: modules are the [bmod] records of the skills' bmod.toml
-// files, the skills come from each module's module-help.csv.
+// files, plus the _bmad/<name>/ folders that only carry config.yaml (tea, bmb...).
+// Skills come from each module's module-help.csv, else from bmod.toml's skills list.
 async function collectV7($: $, root: string): Promise<{ version?: string; modules: BmadModule[]; skills: BmadSkill[] }> {
   const modules: BmadModule[] = []
+  const listed: BmadSkill[] = []
   for (const e of await list($, `${root}/.agents/skills`)) {
     if (e.kind === 'file') continue // a symlinked skill folder lists as 'other'
     const b = obj((await cached($, `${root}/.agents/skills/${e.name}/bmod.toml`, undefined, parseToml))?.bmod)
     const name = str(b.code)
-    if (name) modules.push({ name, version: str(b.version), source: str(b.update_source) })
+    if (!name) continue
+    modules.push({ name, version: str(b.version), source: str(b.update_source) })
+    const required = arr(b.required_skills).map(r => str(r) ?? str(obj(r).skill))
+    for (const skill of arr(b.skills).map(str)) if (skill) listed.push({ name: skill, module: name, required: required.includes(skill) })
   }
-  modules.sort((a, b) => a.name.localeCompare(b.name))
   const skills: BmadSkill[] = []
+  const covered = new Set<string>()
   for (const e of await list($, `${root}/_bmad`)) {
     if (e.kind !== 'dir' || e.name.startsWith('_')) continue
-    const rows = (await cached($, `${root}/_bmad/${e.name}/module-help.csv`, undefined, parseCsv)) ?? []
-    for (const r of rows) if (r.skill && r.skill !== '_meta') skills.push(skillOf(r))
+    const dir = `${root}/_bmad/${e.name}`
+    const rows = await cached($, `${dir}/module-help.csv`, undefined, parseCsv)
+    for (const r of rows ?? []) {
+      if (!r.skill || r.skill === '_meta') continue
+      skills.push(skillOf(r))
+      covered.add(r.skill)
+    }
+    const version = await cached($, `${dir}/config.yaml`, undefined, headerVersion)
+    if ((rows || (await $.fs.exists(`${dir}/config.yaml`))) && !modules.some(m => m.name === e.name)) modules.push({ name: e.name, version })
   }
+  skills.push(...listed.filter(s => !covered.has(s.name)))
+  modules.sort((a, b) => a.name.localeCompare(b.name))
   return { version: (modules.find(m => m.name === 'method') ?? modules.find(m => m.version))?.version, modules, skills }
 }
 
 // ---------- v7 tickets ----------
 
 const TICKETS = '_bmad/method/scripts/tickets.py'
+export const BACKLOG_EPIC = 999 // stories without an epic; the UI shows this num, and it sorts after real epics
+
+export const TICKETS_NOTE = "The ticket tree is only read for the session's project, because reading it runs the project's tickets.py."
+const TICKETS_MAX_AGE_MS = 2 * 60_000
+
+// Changes to anything under the initiative folder (tickets.toml, the ticket
+// files, backlog/) or to the script itself make the cached output stale.
+async function ticketsFingerprint($: $, folder: string, script: string): Promise<string> {
+  const files = await walk($, folder, 4, n => SKIP_DIRS.has(n))
+  const parts = files.map(f => `${f.rel}:${f.entry.mtimeMs}:${f.entry.size}`).sort()
+  parts.push(`script:${await statKey($, script)}`)
+  return parts.join('|')
+}
 
 // The ticket rules stay in the project's own script; this only maps its JSON
 // onto the sprint shape. Epic titles are not in that JSON, tickets.toml has them.
-async function collectTickets($: $, root: string, output: string, initiative: string | undefined, errors: string[]): Promise<BmadSnapshot['sprint']> {
-  if (!initiative) return undefined
-  const file = `${output}/${initiative}/tickets/tickets.toml`
+// Running the script is running the project's code, so callers pass
+// `runScripts: false` for any folder that is not the session's own project.
+async function collectTickets(
+  $: $,
+  root: string,
+  output: string,
+  initiative: string | undefined,
+  errors: string[],
+  opts: { runScripts: boolean; fresh: boolean },
+): Promise<{ sprint?: BmadSnapshot['sprint']; note?: string }> {
+  if (!initiative) return {}
+  const folder = `${output}/${initiative}`
+  const file = `${folder}/tickets/tickets.toml`
   const plan = await cached($, file, undefined, parseToml)
-  if (!plan) return undefined
+  if (!plan) return {}
+  if (!opts.runScripts) return { note: TICKETS_NOTE }
   const script = `${root}/${TICKETS}`
   if (!(await $.fs.exists(script))) {
     errors.push(`${TICKETS} not found`)
-    return undefined
+    return {}
   }
-  // the script needs python >= 3.11; uv reads its header and finds one
-  let stdout: string | undefined
-  let failure: string | undefined
-  for (const cmd of [['python3'], ['uv', 'run']]) {
-    try {
-      const r = await $.process.run([...cmd, script, '--project-root', root, 'status'], { cwd: root, timeoutMs: 15000 })
-      if (r.exitCode === 0) {
-        stdout = r.stdout
-        break
+
+  const fingerprint = await ticketsFingerprint($, folder, script)
+  const hit = ticketsCache.get(root)
+  let status: Obj | undefined
+  if (!opts.fresh && hit && hit.key === fingerprint && Date.now() - hit.at < TICKETS_MAX_AGE_MS) {
+    hit.used = generation
+    status = hit.status
+  } else {
+    // the script needs python >= 3.11; uv reads its header and finds one.
+    // The launcher that worked last time goes first.
+    const launch = [['python3'], ['uv', 'run']]
+    const known = launchers.get(root)?.join(' ')
+    launch.sort((a, b) => Number(b.join(' ') === known) - Number(a.join(' ') === known))
+    let stdout: string | undefined
+    let failure: string | undefined
+    for (const cmd of launch) {
+      try {
+        const r = await $.process.run([...cmd, script, '--project-root', root, 'status'], { cwd: root, timeoutMs: 15000 })
+        if (r.exitCode === 0) {
+          stdout = r.stdout
+          launchers.set(root, cmd)
+          break
+        }
+        failure ??= r.stderr.trim().split('\n').pop()
+      } catch (e) {
+        failure ??= String((e as Error)?.message ?? e)
       }
-      failure ??= r.stderr.trim().split('\n').pop()
-    } catch (e) {
-      failure ??= String((e as Error)?.message ?? e)
     }
-  }
-  if (stdout === undefined) {
-    errors.push(`tickets.py failed: ${failure || 'no output'}`.slice(0, 160))
-    return undefined
-  }
-  let status: Obj
-  try {
-    status = obj(JSON.parse(stdout) as Json)
-  } catch {
-    errors.push('tickets.py did not print JSON')
-    return undefined
+    if (stdout === undefined) {
+      errors.push(`tickets.py failed: ${failure || 'no output'}`.slice(0, 160))
+      return {}
+    }
+    try {
+      status = obj(JSON.parse(stdout) as Json)
+    } catch {
+      errors.push('tickets.py did not print JSON')
+      return {}
+    }
+    ticketsCache.set(root, { key: fingerprint, at: Date.now(), status, used: generation })
   }
 
   const titles = new Map(arr(plan.epic).map(e => [str(obj(e).slug), str(obj(e).title)]))
@@ -632,15 +763,17 @@ async function collectTickets($: $, root: string, output: string, initiative: st
     const slug = str(e.slug) ?? ''
     epics.set(slug, { num: Number(e.id), title: titles.get(slug) ?? slug, status: str(e.status) || 'backlog', stories: [] })
   }
+  const loose = arr(obj(status.backlog).tickets)
+  if (loose.length) epics.set('backlog', { num: BACKLOG_EPIC, title: 'backlog', status: 'backlog', stories: [] })
   const counts: Record<string, number> = {}
-  for (const t of arr(status.tickets).map(obj)) {
+  for (const t of [...arr(status.tickets), ...loose].map(obj)) {
     const ep = epics.get(str(t.epic) ?? '')
     if (!ep) continue
     const state = str(t.state) ?? 'backlog'
     const st = state === 'planned' ? 'backlog' : state
     counts[st] = (counts[st] ?? 0) + 1
     ep.stories.push({
-      key: str(t.ref) ?? `${ep.num}.${t.id}`,
+      key: str(t.ref) ?? `${ep.num}.${str(t.id) ?? str(t.file)}`,
       epic: ep.num,
       num: str(t.id) ?? '',
       title: str(t.title),
@@ -651,18 +784,38 @@ async function collectTickets($: $, root: string, output: string, initiative: st
     })
   }
   return {
-    file: file.slice(root.length + 1),
-    generated: new Date().toISOString().slice(0, 16).replace('T', ' '),
-    stale: false,
-    counts,
-    epics: [...epics.values()].sort((a, b) => a.num - b.num),
-    actionItems: [],
+    sprint: {
+      file: file.slice(root.length + 1),
+      generated: new Date().toISOString().slice(0, 16).replace('T', ' '),
+      stale: false,
+      counts,
+      epics: [...epics.values()].sort((a, b) => a.num - b.num),
+      actionItems: [],
+    },
   }
 }
 
 // ---------- the snapshot ----------
 
-export async function collect($: $, root: string): Promise<BmadSnapshot> {
+export type CollectOptions = {
+  // run the project's own scripts (tickets.py); false for any folder but the session's project
+  runScripts?: boolean
+  // ignore remembered script output (the manual refresh)
+  fresh?: boolean
+}
+
+export async function collect($: $, root: string, opts: CollectOptions = {}): Promise<BmadSnapshot> {
+  generation++
+  memoizeLists(true)
+  try {
+    return await collectAll($, root, { runScripts: opts.runScripts !== false, fresh: opts.fresh === true })
+  } finally {
+    memoizeLists(false)
+    prune()
+  }
+}
+
+async function collectAll($: $, root: string, opts: { runScripts: boolean; fresh: boolean }): Promise<BmadSnapshot> {
   const started = Date.now()
   const errors: string[] = []
   const bmad = `${root}/_bmad`
@@ -728,225 +881,252 @@ export async function collect($: $, root: string): Promise<BmadSnapshot> {
   const help = (await cached($, `${bmad}/_config/bmad-help.csv`, undefined, parseCsv)) ?? []
   const skills: BmadSkill[] = v7?.skills ?? help.map(skillOf)
 
-  // epic and story titles
-  const titles = { epics: new Map<number, string>(), stories: new Map<string, string>() }
-  for (const f of await walk($, paths.planning, 2, n => SKIP_DIRS.has(n))) {
-    if (!/epic/i.test(f.rel) || !f.rel.endsWith('.md')) continue
-    const t = await cached($, f.path, f.entry, parseEpicTitles)
-    if (!t) continue
-    for (const [k, v] of t.epics) if (!titles.epics.has(k)) titles.epics.set(k, v)
-    for (const [k, v] of t.stories) if (!titles.stories.has(k)) titles.stories.set(k, v)
-  }
+  const sprintPart = async () => {
+    // epic and story titles
+    const titles = { epics: new Map<number, string>(), stories: new Map<string, string>() }
+    for (const f of await walk($, paths.planning, 2, n => SKIP_DIRS.has(n))) {
+      if (!f.rel.endsWith('.md') || planningKind(f.rel) !== 'epics') continue
+      const t = await cached($, f.path, f.entry, parseEpicTitles)
+      if (!t) continue
+      for (const [k, v] of t.epics) if (!titles.epics.has(k)) titles.epics.set(k, v)
+      for (const [k, v] of t.stories) if (!titles.stories.has(k)) titles.stories.set(k, v)
+    }
 
-  // implementation artifacts: story files, retros, build-auto results
-  const impl = await list($, paths.implementation)
-  const storyFiles = new Map<string, StoryFile & { file: string; mtimeMs: number }>()
-  const retros = new Map<number, { verdict?: string; file: string }>()
-  const buildAuto: BmadArtifact[] = []
-  const byStatus: Record<string, number> = {}
-  const other: BmadArtifact[] = []
-  for (const e of impl) {
-    if (e.kind !== 'file' || !e.name.endsWith('.md')) continue
-    const path = `${paths.implementation}/${e.name}`
-    if (e.name.startsWith('bmad-build-auto-result-')) {
-      const doc = await cached($, path, e, frontmatter)
-      if (!doc) continue
-      const status = str(doc.fm.status) ?? /^Status:\s*(\S+)/m.exec(doc.body)?.[1] ?? 'unknown'
-      byStatus[status] = (byStatus[status] ?? 0) + 1
-      const a = artifactOf(e.name, 'build-auto', doc, e.mtimeMs)
-      a.status = status
-      const blocking = /^Blocking condition:\s*(.+)$/m.exec(doc.body)?.[1]
-      if (blocking) a.extra = { ...a.extra, blocking }
-      buildAuto.push(a)
-      continue
-    }
-    const retro = /^epic-(\d+)-retro/.exec(e.name)
-    if (retro) {
-      const doc = await cached($, path, e, frontmatter)
-      let verdict = str(doc?.fm.verdict)
-      if (!verdict && doc) verdict = /\*\*Status:\*\*\s*(.+)$/m.exec(doc.body)?.[1].trim()
-      retros.set(Number(retro[1]), { verdict, file: e.name })
-      continue
-    }
-    const spec = SPEC_FILE.exec(e.name)
-    if (spec || STORY_FILE.test(e.name)) {
-      const format = spec ? 'spec' : 'legacy'
-      const parsed = await cached($, path, e, t => parseStory(t, format), `story-${format}`)
-      if (parsed) storyFiles.set(spec ? spec[1] : e.name.replace(/\.md$/, ''), { ...parsed, file: e.name, mtimeMs: e.mtimeMs })
-      continue
-    }
-    if (e.name === 'deferred-work.md' || e.name === 'sprint-status.yaml') continue
-    const doc = await cached($, path, e, frontmatter)
-    if (doc) other.push(artifactOf(e.name, /context/.test(e.name) ? 'epic-context' : 'impl-doc', doc, e.mtimeMs))
-  }
-  buildAuto.sort((a, b) => b.mtimeMs - a.mtimeMs)
-
-  const fileFor = (key: string) => {
-    const nums = storyNumbers(key)
-    const direct = storyFiles.get(key)
-    if (direct) return { slug: key, f: direct }
-    if (!nums) return undefined
-    for (const [slug, f] of storyFiles) {
-      const n = storyNumbers(slug)
-      if (n && n.epic === nums.epic && n.num === nums.num && !slug.startsWith('dw-')) return { slug, f }
-    }
-    return undefined
-  }
-
-  // sprint status
-  let sprint: BmadSnapshot['sprint']
-  const used = new Set<string>()
-  const sprintCandidates = [`${paths.implementation}/sprint-status.yaml`, `${output}/sprint-status.yaml`, `${paths.implementation}/sprint-status.yml`]
-  for (const file of sprintCandidates) {
-    const y = await cached($, file, undefined, parseYaml)
-    if (!y) continue
-    const doc = obj(y)
-    const dev = obj(doc.development_status)
-    const epics = new Map<number, BmadEpic>()
-    const epicOf = (n: number): BmadEpic => {
-      let ep = epics.get(n)
-      if (!ep) {
-        ep = { num: n, title: titles.epics.get(n), status: 'backlog', stories: [] }
-        epics.set(n, ep)
-      }
-      return ep
-    }
-    const counts: Record<string, number> = {}
-    for (const [key, v] of Object.entries(dev)) {
-      const raw = str(v) ?? 'backlog'
-      const status = SPRINT_ALIASES[raw] ?? raw
-      let m = /^epic-(\d+)-retrospective$/.exec(key)
-      if (m) {
-        epicOf(Number(m[1])).retro = status
+    // implementation artifacts: story files, retros, build-auto results
+    const impl = await list($, paths.implementation)
+    const storyFiles = new Map<string, StoryFile & { file: string; mtimeMs: number }>()
+    const retros = new Map<number, { verdict?: string; file: string }>()
+    const buildAuto: BmadArtifact[] = []
+    const byStatus: Record<string, number> = {}
+    const other: BmadArtifact[] = []
+    for (const e of impl) {
+      if (e.kind !== 'file' || !e.name.endsWith('.md')) continue
+      const path = `${paths.implementation}/${e.name}`
+      if (e.name.startsWith('bmad-build-auto-result-')) {
+        const doc = await cached($, path, e, frontmatter)
+        if (!doc) continue
+        const status = str(doc.fm.status) ?? /^Status:\s*(\S+)/m.exec(doc.body)?.[1] ?? 'unknown'
+        byStatus[status] = (byStatus[status] ?? 0) + 1
+        const a = artifactOf(e.name, 'build-auto', doc, e.mtimeMs)
+        a.status = status
+        const blocking = /^Blocking condition:\s*(.+)$/m.exec(doc.body)?.[1]
+        if (blocking) a.extra = { ...a.extra, blocking }
+        buildAuto.push(a)
         continue
       }
-      m = /^epic-(\d+)$/.exec(key)
-      if (m) {
-        epicOf(Number(m[1])).status = status
+      const retro = /^epic-(\d+)-retro/.exec(e.name)
+      if (retro) {
+        const doc = await cached($, path, e, frontmatter)
+        let verdict = str(doc?.fm.verdict)
+        if (!verdict && doc) verdict = /\*\*Status:\*\*\s*(.+)$/m.exec(doc.body)?.[1].trim()
+        retros.set(Number(retro[1]), { verdict, file: e.name })
         continue
       }
+      const spec = SPEC_FILE.exec(e.name)
+      if (spec || STORY_FILE.test(e.name)) {
+        const format = spec ? 'spec' : 'legacy'
+        const parsed = await cached($, path, e, t => parseStory(t, format), `story-${format}`)
+        if (parsed) storyFiles.set(spec ? spec[1] : e.name.replace(/\.md$/, ''), { ...parsed, file: e.name, mtimeMs: e.mtimeMs })
+        continue
+      }
+      if (e.name === 'deferred-work.md' || e.name === 'sprint-status.yaml') continue
+      const doc = await cached($, path, e, frontmatter)
+      if (doc) other.push(artifactOf(e.name, /context/.test(e.name) ? 'epic-context' : 'impl-doc', doc, e.mtimeMs))
+    }
+    buildAuto.sort((a, b) => b.mtimeMs - a.mtimeMs)
+
+    const fileFor = (key: string) => {
       const nums = storyNumbers(key)
-      if (!nums) continue
-      counts[status] = (counts[status] ?? 0) + 1
-      const hit = fileFor(key)
-      if (hit) used.add(hit.slug)
-      const f = hit?.f
-      epicOf(nums.epic).stories.push({
-        key,
-        epic: nums.epic,
-        num: nums.num,
-        title: titles.stories.get(`${nums.epic}-${nums.num}`) ?? f?.title ?? key.replace(/^\d+-\d+[a-z]?-/, '').replace(/-/g, ' '),
-        status,
-        file: f?.file,
-        format: f?.format,
-        fileStatus: f?.fileStatus,
-        type: f?.type,
-        route: f?.route,
-        tasksDone: f?.tasksDone,
-        tasksTotal: f?.tasksTotal,
-        reviewOpen: f?.reviewOpen,
-        reviewDone: f?.reviewDone,
-        updatedMs: f?.mtimeMs,
+      const direct = storyFiles.get(key)
+      if (direct) return { slug: key, f: direct }
+      if (!nums) return undefined
+      for (const [slug, f] of storyFiles) {
+        const n = storyNumbers(slug)
+        if (n && n.epic === nums.epic && n.num === nums.num && !slug.startsWith('dw-')) return { slug, f }
+      }
+      return undefined
+    }
+
+    // sprint status
+    let sprint: BmadSnapshot['sprint']
+    const used = new Set<string>()
+    const sprintCandidates = [`${paths.implementation}/sprint-status.yaml`, `${output}/sprint-status.yaml`, `${paths.implementation}/sprint-status.yml`]
+    for (const file of sprintCandidates) {
+      const y = await cached($, file, undefined, parseYaml)
+      if (!y) continue
+      const doc = obj(y)
+      const dev = obj(doc.development_status)
+      const epics = new Map<number, BmadEpic>()
+      const epicOf = (n: number): BmadEpic => {
+        let ep = epics.get(n)
+        if (!ep) {
+          ep = { num: n, title: titles.epics.get(n), status: 'backlog', stories: [] }
+          epics.set(n, ep)
+        }
+        return ep
+      }
+      const counts: Record<string, number> = {}
+      for (const [key, v] of Object.entries(dev)) {
+        const raw = str(v) ?? 'backlog'
+        const yamlStatus = SPRINT_ALIASES[raw] ?? raw
+        let m = /^epic-(\d+)-retrospective$/.exec(key)
+        if (m) {
+          epicOf(Number(m[1])).retro = yamlStatus
+          continue
+        }
+        m = /^epic-(\d+)$/.exec(key)
+        if (m) {
+          epicOf(Number(m[1])).status = yamlStatus
+          continue
+        }
+        const nums = storyNumbers(key)
+        if (!nums) continue
+        const hit = fileFor(key)
+        if (hit) used.add(hit.slug)
+        const f = hit?.f
+        // people mark the story file as dropped and forget the yaml
+        const status = isDroppedStatus(f?.status) ? 'dropped' : yamlStatus
+        counts[status] = (counts[status] ?? 0) + 1
+        epicOf(nums.epic).stories.push({
+          key,
+          epic: nums.epic,
+          num: nums.num,
+          title: titles.stories.get(`${nums.epic}-${nums.num}`) ?? f?.title ?? key.replace(/^\d+-\d+[a-z]?-/, '').replace(/-/g, ' '),
+          status,
+          file: f?.file,
+          format: f?.format,
+          fileStatus: f?.fileStatus,
+          type: f?.type,
+          route: f?.route,
+          tasksDone: f?.tasksDone,
+          tasksTotal: f?.tasksTotal,
+          reviewOpen: f?.reviewOpen,
+          reviewDone: f?.reviewDone,
+          updatedMs: f?.mtimeMs,
+        })
+      }
+      for (const [n, r] of retros) {
+        const ep = epicOf(n)
+        ep.retroVerdict = r.verdict
+        ep.retroFile = r.file
+      }
+      const actionItems: BmadActionItem[] = arr(doc.action_items).map(a => {
+        const o = obj(a)
+        return { id: str(o.id), epic: str(o.epic), action: str(o.action) ?? '', owner: str(o.owner), status: str(o.status) ?? 'open', ref: str(o.ref) }
+      })
+      const lastUpdated = str(doc.last_updated)
+      const when = parseSprintDate(lastUpdated ?? str(doc.generated))
+      sprint = {
+        file: file.slice(root.length + 1),
+        generated: str(doc.generated),
+        lastUpdated,
+        stale: when !== undefined && Date.now() - when > 7 * 86400_000,
+        counts,
+        epics: [...epics.values()].sort((a, b) => a.num - b.num),
+        actionItems,
+      }
+      break
+    }
+    let sprintNote: string | undefined
+    if (!sprint && v7) {
+      const t = await collectTickets($, root, output, str(core.active_initiative), errors, opts)
+      sprint = t.sprint
+      sprintNote = t.note
+    }
+
+    const storiesOutsideSprint: BmadStory[] = []
+    for (const [slug, f] of storyFiles) {
+      if (used.has(slug)) continue
+      const nums = storyNumbers(slug)
+      storiesOutsideSprint.push({
+        key: slug,
+        epic: nums?.epic ?? 0,
+        num: nums?.num ?? '',
+        title: f.title,
+        status: f.status ?? 'unknown',
+        file: f.file,
+        format: f.format,
+        fileStatus: f.fileStatus,
+        type: f.type,
+        route: f.route,
+        tasksDone: f.tasksDone,
+        tasksTotal: f.tasksTotal,
+        reviewOpen: f.reviewOpen,
+        reviewDone: f.reviewDone,
+        updatedMs: f.mtimeMs,
       })
     }
-    for (const [n, r] of retros) {
-      const ep = epicOf(n)
-      ep.retroVerdict = r.verdict
-      ep.retroFile = r.file
-    }
-    const actionItems: BmadActionItem[] = arr(doc.action_items).map(a => {
-      const o = obj(a)
-      return { id: str(o.id), epic: str(o.epic), action: str(o.action) ?? '', owner: str(o.owner), status: str(o.status) ?? 'open', ref: str(o.ref) }
-    })
-    const lastUpdated = str(doc.last_updated)
-    const when = parseSprintDate(lastUpdated ?? str(doc.generated))
-    sprint = {
-      file: file.slice(root.length + 1),
-      generated: str(doc.generated),
-      lastUpdated,
-      stale: when !== undefined && Date.now() - when > 7 * 86400_000,
-      counts,
-      epics: [...epics.values()].sort((a, b) => a.num - b.num),
-      actionItems,
-    }
-    break
+    storiesOutsideSprint.sort((a, b) => (b.updatedMs ?? 0) - (a.updatedMs ?? 0))
+    return { sprint, sprintNote, storiesOutsideSprint, other: other.sort((a, b) => b.mtimeMs - a.mtimeMs), buildAuto, byStatus }
   }
-  if (!sprint && v7) sprint = await collectTickets($, root, output, str(core.active_initiative), errors)
 
-  const storiesOutsideSprint: BmadStory[] = []
-  for (const [slug, f] of storyFiles) {
-    if (used.has(slug)) continue
-    const nums = storyNumbers(slug)
-    storiesOutsideSprint.push({
-      key: slug,
-      epic: nums?.epic ?? 0,
-      num: nums?.num ?? '',
-      title: f.title,
-      status: f.status ?? 'unknown',
-      file: f.file,
-      format: f.format,
-      fileStatus: f.fileStatus,
-      type: f.type,
-      route: f.route,
-      tasksDone: f.tasksDone,
-      tasksTotal: f.tasksTotal,
-      reviewOpen: f.reviewOpen,
-      reviewDone: f.reviewDone,
-      updatedMs: f.mtimeMs,
-    })
-  }
-  storiesOutsideSprint.sort((a, b) => (b.updatedMs ?? 0) - (a.updatedMs ?? 0))
-
-  // deferred work
-  const deferred = (await cached($, `${paths.implementation}/deferred-work.md`, undefined, parseDeferred)) ?? []
-
-  // planning, specs, tests and the rest of the output folder
-  const planning = await docArtifacts($, paths.planning, 3, planningKind, rel => !/(^|\/)reviews?\//.test(rel) || /review-/.test(rel))
-  const changeProposals = planning.filter(a => a.kind === 'change-proposal')
+  // The parts below do not depend on each other, so they run together. Each
+  // keeps its own order, and the snapshot is assembled from them in the order
+  // it always had.
   const specsDir = `${output}/specs`
-  for (const a of await docArtifacts($, specsDir, 2, () => 'spec', rel => /SPEC\.md$|RETROSPECTIVE\.md$/.test(rel))) planning.push({ ...a, path: `specs/${a.path}` })
-  const contextMd = await cached($, `${output}/project-context.md`, undefined, frontmatter)
-  if (contextMd) planning.push(artifactOf('project-context.md', 'project-context', contextMd, 0))
-  const agentsMd = await readText($, `${root}/AGENTS.md`)
-  if (agentsMd && /bmad:context/.test(agentsMd)) planning.push({ path: 'AGENTS.md', kind: 'project-context', title: 'AGENTS.md (bmad:context)', mtimeMs: 0 })
-
-  const quality = paths.tests.startsWith(paths.implementation) ? [] : await docArtifacts($, paths.tests, 3, qualityKind)
-  const qSummary = await qualitySummary($, paths.tests, quality)
-  // the full list stays, the per-file fields only for the newest ones
-  const qualityLean = quality.map((a, i) => (i < 40 ? a : { ...a, extra: undefined }))
-  const wfStatus = await workflowStatus($, output, paths.planning)
-  const wds = await collectWds($, root, resolvePath(val('design_artifacts', 'wds'), root, vars))
-  const automator = await collectAutomator($, root, output)
-  const builder = await collectBuilder($, resolvePath(val('bmad_builder_output_folder', 'bmb'), root, vars))
-
   const known = new Set([paths.planning, paths.implementation, paths.tests, specsDir, `${output}/story-automator`].map(p => p.replace(/\/+$/, '')))
-  const creative: BmadArtifact[] = []
-  const inProgressSessions: BmadArtifact[] = []
-  for (const e of await list($, output)) {
-    const p = `${output}/${e.name}`
-    if (e.kind === 'dir' && !known.has(p)) {
-      for (const a of await docArtifacts($, p, 3, () => e.name)) creative.push({ ...a, path: `${e.name}/${a.path}` })
-    } else if (e.kind === 'file' && /\.md$/.test(e.name) && e.name !== 'project-context.md') {
-      const doc = await cached($, p, e, frontmatter)
-      if (doc) creative.push(artifactOf(e.name, 'output', doc, e.mtimeMs))
+
+  const planningPart = async () => {
+    const docs = await docArtifacts($, paths.planning, 3, planningKind, rel => !/(^|\/)reviews?\//.test(rel) || /review-/.test(rel))
+    const planning = [...docs]
+    for (const a of await docArtifacts($, specsDir, 2, () => 'spec', rel => /SPEC\.md$|RETROSPECTIVE\.md$/.test(rel))) planning.push({ ...a, path: `specs/${a.path}` })
+    const contextMd = await cached($, `${output}/project-context.md`, undefined, frontmatter)
+    if (contextMd) planning.push(artifactOf('project-context.md', 'project-context', contextMd, 0))
+    const agentsMd = await readText($, `${root}/AGENTS.md`)
+    if (agentsMd && /bmad:context/.test(agentsMd)) planning.push({ path: 'AGENTS.md', kind: 'project-context', title: 'AGENTS.md (bmad:context)', mtimeMs: 0 })
+    return { planning, changeProposals: docs.filter(a => a.kind === 'change-proposal') }
+  }
+
+  const qualityPart = async () => {
+    const quality = paths.tests.startsWith(paths.implementation) ? [] : await docArtifacts($, paths.tests, 3, qualityKind)
+    const summary = await qualitySummary($, paths.tests, quality)
+    // the full list stays, the per-file fields only for the newest ones
+    return { summary, lean: quality.map((a, i) => (i < 40 ? a : { ...a, extra: undefined })) }
+  }
+
+  const outputPart = async () => {
+    const creative: BmadArtifact[] = []
+    for (const e of await list($, output)) {
+      const p = `${output}/${e.name}`
+      if (e.kind === 'dir' && !known.has(p)) {
+        for (const a of await docArtifacts($, p, 3, () => e.name)) creative.push({ ...a, path: `${e.name}/${a.path}` })
+      } else if (e.kind === 'file' && /\.md$/.test(e.name) && e.name !== 'project-context.md') {
+        const doc = await cached($, p, e, frontmatter)
+        if (doc) creative.push(artifactOf(e.name, 'output', doc, e.mtimeMs))
+      }
     }
-  }
-  creative.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    creative.sort((a, b) => b.mtimeMs - a.mtimeMs)
 
-  for (const f of await walk($, output, 4, n => SKIP_DIRS.has(n) || n === 'implementation-artifacts')) {
-    if (!f.rel.endsWith('.memlog.md')) continue
-    const doc = await cached($, f.path, f.entry, frontmatter)
-    if (!doc || /complete|done|final/i.test(str(doc.fm.status) ?? '')) continue
-    const a = artifactOf(f.rel.replace(/\/\.memlog\.md$/, ''), 'session', doc, f.entry.mtimeMs)
-    a.title = str(doc.fm.topic) ?? str(doc.fm.goal) ?? a.path
-    const lastLine = doc.body.trim().split('\n').filter(l => /^\s*-\s/.test(l)).pop()
-    if (lastLine) a.extra = { ...a.extra, last: lastLine.replace(/^\s*-\s*/, '').slice(0, 160) }
-    inProgressSessions.push(a)
+    const inProgressSessions: BmadArtifact[] = []
+    for (const f of await walk($, output, 4, n => SKIP_DIRS.has(n) || n === 'implementation-artifacts')) {
+      if (!f.rel.endsWith('.memlog.md')) continue
+      const doc = await cached($, f.path, f.entry, frontmatter)
+      if (!doc || isFinishedStatus(str(doc.fm.status))) continue
+      const a = artifactOf(f.rel.replace(/\/\.memlog\.md$/, ''), 'session', doc, f.entry.mtimeMs)
+      a.title = str(doc.fm.topic) ?? str(doc.fm.goal) ?? a.path
+      const lastLine = doc.body.trim().split('\n').filter(l => /^\s*-\s/.test(l)).pop()
+      if (lastLine) a.extra = { ...a.extra, last: lastLine.replace(/^\s*-\s*/, '').slice(0, 160) }
+      inProgressSessions.push(a)
+    }
+    inProgressSessions.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    return { creative, inProgressSessions }
   }
-  inProgressSessions.sort((a, b) => b.mtimeMs - a.mtimeMs)
 
-  const loop = await collectLoop($, root, modules.some(m => m.name === 'bmad-loop'))
-  const git = await collectGit($, root)
+  const [sp, deferredRaw, pl, q, wfStatus, wds, automator, builder, out, loop, git] = await Promise.all([
+    sprintPart(),
+    cached($, `${paths.implementation}/deferred-work.md`, undefined, parseDeferred),
+    planningPart(),
+    qualityPart(),
+    workflowStatus($, output, paths.planning),
+    collectWds($, root, resolvePath(val('design_artifacts', 'wds'), root, vars)),
+    collectAutomator($, root, output),
+    collectBuilder($, resolvePath(val('bmad_builder_output_folder', 'bmb'), root, vars)),
+    outputPart(),
+    collectLoop($, root, modules.some(m => m.name === 'bmad-loop')),
+    collectGit($, root),
+  ])
+  const { sprint, sprintNote, storiesOutsideSprint, other, buildAuto, byStatus } = sp
+  const deferred = deferredRaw ?? []
 
   return {
     at: Date.now(),
@@ -970,21 +1150,22 @@ export async function collect($: $, root: string): Promise<BmadSnapshot> {
     agents,
     skills,
     sprint,
+    sprintNote,
     storiesOutsideSprint,
-    planning,
-    quality: qualityLean,
-    qualitySummary: qSummary,
+    planning: pl.planning,
+    quality: q.lean,
+    qualitySummary: q.summary,
     workflowStatus: wfStatus,
     wds,
     orchestrations: automator.orchestrations,
     automatorActive: automator.active,
     builder,
-    creative,
-    other: other.sort((a, b) => b.mtimeMs - a.mtimeMs),
-    inProgressSessions,
+    creative: out.creative,
+    other,
+    inProgressSessions: out.inProgressSessions,
     deferred,
     buildAuto: { total: buildAuto.length, byStatus, latest: buildAuto.slice(0, 15) },
-    changeProposals,
+    changeProposals: pl.changeProposals,
     loop,
     git,
     errors,

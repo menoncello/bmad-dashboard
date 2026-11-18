@@ -183,6 +183,8 @@ export type BmadSnapshot = {
     epics: BmadEpic[]
     actionItems: BmadActionItem[]
   }
+  // why the sprint is empty when it is not an error (v7 ticket tree left unread)
+  sprintNote?: string
   storiesOutsideSprint: BmadStory[]
   planning: BmadArtifact[]
   quality: BmadArtifact[]
@@ -213,6 +215,9 @@ export type BmadProjectSummary = {
   loop?: string
 }
 
+// what a project scan found: folders with a _bmad, the ones not saved yet, saved ones dropped
+export type BmadScanResult = { found: number; added: number; removed: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'bmad-dashboard': {
@@ -222,6 +227,7 @@ declare module 'claude-code' {
       loading: boolean
       projects: BmadProjectSummary[]
       root: string
+      scan: { running: boolean; result?: BmadScanResult }
     }
   }
 }

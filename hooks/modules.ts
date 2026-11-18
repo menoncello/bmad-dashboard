@@ -1,7 +1,7 @@
 // Collectors for the external modules: TEA's gates and reviews, WDS's design
 // log, the story automator's orchestrations, BMB's built skills, and the
 // per-module workflow status files (GDS, WDS, older BMM).
-import type { EngineInterface } from 'claude-code'
+import type { EngineInterface, FsEntry } from 'claude-code'
 
 import type { BmadArtifact, BmadBuilderSkill, BmadDesignPage, BmadGate, BmadOrchestration, BmadQualitySummary, BmadWds } from '../types'
 import { arr, frontmatter, obj, parseYaml, str } from './parse'
@@ -17,12 +17,26 @@ async function readText($: $, path: string): Promise<string | undefined> {
   }
 }
 
-async function list($: $, dir: string) {
-  try {
-    return await $.fs.list(dir)
-  } catch {
-    return []
-  }
+// While a collect runs, each directory is listed once: concurrent and repeated
+// callers share the first answer. Outside a collect nothing is remembered.
+let listMemo: Map<string, Promise<FsEntry[]>> | undefined
+
+export function memoizeLists(on: boolean): void {
+  listMemo = on ? new Map() : undefined
+}
+
+export function list($: $, dir: string): Promise<FsEntry[]> {
+  const hit = listMemo?.get(dir)
+  if (hit) return hit
+  const p = (async () => {
+    try {
+      return await $.fs.list(dir)
+    } catch {
+      return []
+    }
+  })()
+  listMemo?.set(dir, p)
+  return p
 }
 
 function json(text: string | undefined): Obj | undefined {
@@ -33,6 +47,18 @@ function json(text: string | undefined): Obj | undefined {
     return undefined
   }
 }
+
+// Whole-word status test, so "incomplete" and "unresolved" stay open and
+// "not done" is not done. `words` are lower case.
+const NEGATIONS = new Set(['not', 'no', 'non', 'un', 'never'])
+
+export function statusIs(status: string | undefined, words: readonly string[]): boolean {
+  const tokens = (status ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)
+  return tokens.some((t, i) => words.includes(t) && !NEGATIONS.has(tokens[i - 1] ?? ''))
+}
+
+// "This status means the work is finished" (memlog and session files).
+export const isFinishedStatus = (status: string | undefined): boolean => statusIs(status, ['complete', 'completed', 'done', 'final', 'finalized'])
 
 const targetOf = (rel: string) =>
   rel
@@ -236,7 +262,7 @@ export async function collectBuilder($: $, skillsDir: string | undefined): Promi
     const base = `${skillsDir}/${e.name}`
     if (!(await $.fs.exists(`${base}/SKILL.md`))) continue
     const memlog = await readText($, `${base}/.memlog.md`)
-    const inProgress = memlog !== undefined && !/status:\s*(complete|done|final)/i.test(frontmatter(memlog).fm.status ? `status: ${str(frontmatter(memlog).fm.status)}` : '')
+    const inProgress = memlog !== undefined && !isFinishedStatus(str(frontmatter(memlog).fm.status))
     const runs = (await list($, `${base}/.analysis`)).filter(r => r.kind === 'dir').map(r => r.name).sort()
     const last = runs.pop()
     const findings = last ? json(await readText($, `${base}/.analysis/${last}/findings.json`)) : undefined
