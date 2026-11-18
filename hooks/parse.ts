@@ -67,7 +67,8 @@ function yamlScalar(raw: string): Json {
     }
     return o
   }
-  if (/^-?\d+(\.\d+)?$/.test(s) && !/^0\d/.test(s)) return Number(s)
+  // only when the number round-trips: `6.10` and `1.0` stay strings
+  if (/^-?\d+(\.\d+)?$/.test(s) && String(Number(s)) === s) return Number(s)
   return s
 }
 
@@ -76,7 +77,9 @@ function unquote(k: string): string {
   return k
 }
 
-type Line = { indent: number; text: string }
+// Raw lines are kept (blank and comment lines flagged as `skip`) so block scalars
+// can read them verbatim; `text` is the comment-stripped, trimmed line.
+type Line = { indent: number; text: string; raw: string; skip: boolean }
 
 function keyAt(text: string): number {
   // the colon that ends a mapping key: followed by space or end of line, outside quotes
@@ -93,38 +96,108 @@ function keyAt(text: string): number {
   return -1
 }
 
+// `|` or `>` plus an optional chomping indicator (+/-) and indentation digit, in either order
+const BLOCK_HEADER = /^[|>](?:[+-][1-9]?|[1-9][+-]?)?$/
+
 export function parseYaml(src: string): Json {
-  const lines: Line[] = []
-  for (const rawLine of src.replace(/\r/g, '').split('\n')) {
-    if (/^\s*#/.test(rawLine) || /^(---|\.\.\.)\s*$/.test(rawLine)) continue
-    const text = stripComment(rawLine).replace(/\s+$/, '')
-    if (!text.trim()) continue
-    lines.push({ indent: text.length - text.trimStart().length, text: text.trim() })
-  }
+  const lines: Line[] = src
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(raw => {
+      const skip = !raw.trim() || /^\s*#/.test(raw) || /^(---|\.\.\.)\s*$/.test(raw)
+      return {
+        indent: raw.length - raw.trimStart().length,
+        text: skip ? '' : stripComment(raw).trim(),
+        raw,
+        skip,
+      }
+    })
   let i = 0
 
-  function block(indent: number): Json {
-    if (i >= lines.length) return null
-    return lines[i].text.startsWith('- ') || lines[i].text === '-' ? list(lines[i].indent) : map(indent)
+  function skipBlank() {
+    while (i < lines.length && lines[i].skip) i++
   }
 
-  function blockScalar(parentIndent: number, folded: boolean): string {
-    const parts: string[] = []
-    while (i < lines.length && lines[i].indent > parentIndent) parts.push(lines[i++].text)
-    return parts.join(folded ? ' ' : '\n')
+  function isItem(text: string): boolean {
+    return text.startsWith('- ') || text === '-'
+  }
+
+  function block(indent: number): Json {
+    skipBlank()
+    if (i >= lines.length) return null
+    return isItem(lines[i].text) ? list(lines[i].indent) : map(indent)
+  }
+
+  // Joins the following lines onto a flow collection until its brackets balance.
+  function joinFlow(rest: string): string {
+    while (bracketBalance(rest) > 0 && i < lines.length) {
+      const l = lines[i++]
+      if (!l.skip) rest += ' ' + l.text
+    }
+    return rest
+  }
+
+  function blockScalar(parentIndent: number, header: string): string {
+    const folded = header[0] === '>'
+    const keep = header.includes('+')
+    const digit = /[1-9]/.exec(header)
+    let width = digit ? parentIndent + Number(digit[0]) : -1
+    const body: string[] = []
+    while (i < lines.length) {
+      const l = lines[i]
+      if (!l.raw.trim()) {
+        body.push('')
+        i++
+        continue
+      }
+      if (l.indent <= parentIndent || (width >= 0 && l.indent < width)) break
+      if (width < 0) width = l.indent
+      body.push(l.raw.slice(width))
+      i++
+    }
+    let end = body.length
+    while (end > 0 && body[end - 1] === '') end--
+    const content = body.slice(0, end)
+    let text = ''
+    if (!folded) text = content.join('\n')
+    else {
+      let blanks = 0
+      let prev: string | undefined
+      for (const l of content) {
+        if (l === '') {
+          blanks++
+          continue
+        }
+        if (prev === undefined) text = '\n'.repeat(blanks) + l
+        else {
+          const more = /^\s/.test(l) || /^\s/.test(prev)
+          text += (more ? '\n'.repeat(blanks + 1) : blanks ? '\n'.repeat(blanks) : ' ') + l
+        }
+        prev = l
+        blanks = 0
+      }
+    }
+    return keep && content.length ? text + '\n'.repeat(1 + body.length - end) : text
   }
 
   function value(rest: string, indent: number): Json {
-    if (rest === '|' || rest === '|-' || rest === '>' || rest === '>-') return blockScalar(indent, rest.startsWith('>'))
-    if (rest !== '') return yamlScalar(rest)
-    if (i < lines.length && (lines[i].indent > indent || (lines[i].indent === indent && lines[i].text.startsWith('- '))))
+    if (BLOCK_HEADER.test(rest)) return blockScalar(indent, rest)
+    if (rest !== '') return yamlScalar(rest.startsWith('[') || rest.startsWith('{') ? joinFlow(rest) : rest)
+    skipBlank()
+    if (i < lines.length && (lines[i].indent > indent || (lines[i].indent === indent && isItem(lines[i].text)))) {
+      const t = lines[i].text
+      if (t.startsWith('[') || t.startsWith('{')) {
+        i++
+        return yamlScalar(joinFlow(t))
+      }
       return block(lines[i].indent)
+    }
     return null
   }
 
   function map(indent: number): Obj {
     const o: Obj = {}
-    while (i < lines.length && lines[i].indent === indent && !lines[i].text.startsWith('- ')) {
+    for (skipBlank(); i < lines.length && lines[i].indent === indent && !isItem(lines[i].text); skipBlank()) {
       const { text } = lines[i]
       const at = keyAt(text)
       i++
@@ -136,27 +209,35 @@ export function parseYaml(src: string): Json {
 
   function list(indent: number): Json[] {
     const out: Json[] = []
-    while (i < lines.length && lines[i].indent === indent && (lines[i].text.startsWith('- ') || lines[i].text === '-')) {
-      const rest = lines[i].text.slice(1).trim()
+    for (skipBlank(); i < lines.length && lines[i].indent === indent && isItem(lines[i].text); skipBlank()) {
+      let rest = lines[i].text.slice(1).trim()
       i++
       if (rest === '') {
+        skipBlank()
         out.push(i < lines.length && lines[i].indent > indent ? block(lines[i].indent) : null)
         continue
       }
+      if (BLOCK_HEADER.test(rest)) {
+        out.push(blockScalar(indent, rest))
+        continue
+      }
+      if (rest.startsWith('[') || rest.startsWith('{')) rest = joinFlow(rest)
       const at = keyAt(rest)
       if (at > 0 && !rest.startsWith('"') && !rest.startsWith('{') && !rest.startsWith('[')) {
         // a map item: its first key sits on the dash line, the rest indented below
         const itemIndent = indent + 2
         const o: Obj = {}
         o[unquote(rest.slice(0, at).trim())] = value(rest.slice(at + 1).trim(), itemIndent)
-        if (i < lines.length && lines[i].indent > indent && !lines[i].text.startsWith('- ')) Object.assign(o, map(lines[i].indent))
+        skipBlank()
+        if (i < lines.length && lines[i].indent > indent && !isItem(lines[i].text)) Object.assign(o, map(lines[i].indent))
         out.push(o)
       } else out.push(yamlScalar(rest))
     }
     return out
   }
 
-  return lines.length ? block(lines[0].indent) : null
+  skipBlank()
+  return i < lines.length ? block(lines[i].indent) : null
 }
 
 export type Doc = { fm: Obj; body: string }
